@@ -1,5 +1,6 @@
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
+import { useAuthStore } from '@/stores/auth'
 
 const request = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL ?? '/api',
@@ -9,9 +10,10 @@ const request = axios.create({
 // 请求拦截器
 request.interceptors.request.use(
   (config) => {
-    // 在此处添加 token 等通用请求头
-    // const token = localStorage.getItem('token')
-    // if (token) config.headers.Authorization = `Bearer ${token}`
+    const auth = useAuthStore()
+    if (auth.apiKey) {
+      config.headers.Authorization = `Bearer ${auth.apiKey}`
+    }
     return config
   },
   (error) => Promise.reject(error),
