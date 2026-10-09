@@ -31,7 +31,7 @@ function isAbortError(err: unknown): boolean {
 /**
  * 通过 SSE 流式调用 /api/chat/completions
  * - 本地开发：Vite 代理到 https://api.deepseek.com，Authorization 由 .env.local 的 VITE_DEEPSEEK_KEY 注入
- * - 部署后：Vercel Serverless api/chat.ts 同样支持 stream，Authorization 由其处理
+ * - 部署后：Vercel Serverless api/chat/completions.ts 同样支持 stream，Authorization 由其处理
  */
 export function streamChat(
   messages: ChatMessage[],
