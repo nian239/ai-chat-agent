@@ -23,6 +23,11 @@ export interface StreamChatController {
 /** 暴露的 AbortController：发送新消息时由 streamChat 内部 abort 旧实例 */
 let currentController: AbortController | null = null
 
+/** 是否为主动中止（用于区分「用户停止 / 切换会话」与真实网络错误） */
+function isAbortError(err: unknown): boolean {
+  return (err as { name?: string } | null)?.name === 'AbortError'
+}
+
 /**
  * 通过 SSE 流式调用 /api/chat/completions
  * - 本地开发：Vite 代理到 https://api.deepseek.com，Authorization 由 .env.local 的 VITE_DEEPSEEK_KEY 注入
@@ -40,9 +45,30 @@ export function streamChat(
   const apiKey = import.meta.env.VITE_DEEPSEEK_KEY ?? ''
   const url = '/api/chat/completions'
 
+  /**
+   * 终止态标志位：保证 onDone / onError 合计只通知调用方一次
+   * - finishDone：收到 [DONE]，或服务端没发 [DONE] 直接关流（onclose 兜底）
+   * - finishError：网络 / HTTP / 解析异常
+   */
+  let settled = false
+  const finishDone = () => {
+    if (settled) return
+    settled = true
+    handlers.onDone()
+  }
+  const finishError = (err: unknown) => {
+    if (settled) return
+    settled = true
+    handlers.onError(err)
+  }
+
   fetchEventSource(url, {
     method: 'POST',
     signal: controller.signal,
+    // 页面切到后台/隐藏时不中断流。
+    // 默认值 false 会 abort 当前请求，并在页面重新可见后 create() 重发整个请求，
+    // 结果是同一段内容被重复推送、流被提前收尾（停止按钮一闪而过）
+    openWhenHidden: true,
     headers: {
       'Content-Type': 'application/json',
       Accept: 'text/event-stream',
@@ -70,9 +96,9 @@ export function streamChat(
     onmessage: (event: EventSourceMessage) => {
       const payload = event.data?.trim() ?? ''
       if (!payload) return
-      // SSE 结束信号
+      // 结束信号：先通知调用方结束，连接随后由服务端关闭（onclose 不会再重复通知）
       if (payload === '[DONE]') {
-        handlers.onDone()
+        finishDone()
         return
       }
       // JSON 解析容错：单分片坏掉不影响整流
@@ -90,19 +116,20 @@ export function streamChat(
       }
     },
     onerror: (err) => {
-      // onopen 抛出的错误会走这里
-      handlers.onError(err)
-      // 阻止 fetchEventSource 自动重连
+      // 主动 abort 触发的中止不算错误，不通知调用方
+      if (!isAbortError(err)) finishError(err)
+      // 必须 throw 才能阻止 fetchEventSource 自动重连（return 会被当作重试间隔）
       throw err
     },
     onclose: () => {
-      // 服务端正常关闭连接（很多实现不发 [DONE] 直接关流）
-      handlers.onDone()
+      // 兜底：服务端没发 [DONE] 就直接关流时才算正常结束。
+      // 已 [DONE] 或已出错时 finishDone 内部直接返回，不会重复通知
+      finishDone()
     },
   }).catch((err) => {
     // 主动 abort 不当作错误提示
-    if (err?.name === 'AbortError') return
-    handlers.onError(err)
+    if (isAbortError(err)) return
+    finishError(err)
   }).finally(() => {
     if (currentController === controller) {
       currentController = null

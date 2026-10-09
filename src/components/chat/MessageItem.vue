@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, inject } from 'vue'
 import 'highlight.js/styles/github.css'
 import type { ChatMessage } from '@/types/chat'
 import { renderMarkdown } from '@/utils/markdown'
@@ -8,17 +8,56 @@ const props = defineProps<{
   message: ChatMessage
 }>()
 
+interface ChatActions {
+  stopGeneration: (messageId: string) => void
+  regenerate: () => void
+  canRegenerate: (messageId: string) => boolean
+}
+
+const actions = inject<ChatActions>('chatActions')
+
 const isUser = computed(() => props.message.role === 'user')
 const isStreaming = computed(() => props.message.status === 'streaming')
-/** AI 完成态（含 done / error）：用 Markdown 渲染 */
-const isAssistantDone = computed(
+const isStopped = computed(() => props.message.status === 'stopped')
+const isError = computed(() => props.message.status === 'error')
+const isDone = computed(() => props.message.status === 'done' || props.message.status === undefined)
+/** AI 完成态（含 done / error / stopped）：用 Markdown 渲染 */
+const isAssistantRendered = computed(
   () => props.message.role === 'assistant' && !isStreaming.value,
 )
 
-/** 仅在完成态解析 Markdown；其它态返回空串，模板里用 v-if 走纯文本分支 */
-const renderedHtml = computed(() =>
-  isAssistantDone.value ? renderMarkdown(props.message.content) : '',
+/** 极简 HTML 转义：Markdown 渲染失败时降级为纯文本，配合 v-html 使用必须转义 */
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+/**
+ * 仅在完成态解析 Markdown；其它态返回空串，模板里用 v-if 走纯文本分支
+ * try/catch 兜底：渲染函数内抛错会让 .bubble 之后的整行操作按钮（重新生成/重试）一起不渲染
+ */
+const renderedHtml = computed(() => {
+  if (!isAssistantRendered.value) return ''
+  try {
+    return renderMarkdown(props.message.content)
+  } catch (err) {
+    console.warn('[MessageItem] Markdown 渲染失败，降级为纯文本:', err)
+    return escapeHtml(props.message.content)
+  }
+})
+
+/** 是否能对此消息操作（重新生成 / 重试）。停止按钮已统一收到底部输入区，见 ChatInput */
+const showRegenerate = computed(
+  () => props.message.role === 'assistant' && !isStreaming.value &&
+    (isDone.value || isStopped.value) && (actions?.canRegenerate(props.message.id) ?? false),
 )
+const showRetry = computed(
+  () => props.message.role === 'assistant' && isError.value &&
+    (actions?.canRegenerate(props.message.id) ?? false),
+)
+
+function handleRegenerate() {
+  actions?.regenerate()
+}
 
 function formatTime(ts: number): string {
   return new Date(ts).toLocaleTimeString('zh-CN', {
@@ -43,10 +82,32 @@ function formatTime(ts: number): string {
           >{{ message.content }}<span class="cursor">▍</span></pre
         >
 
-        <!-- 3) AI 完成/错误：渲染 Markdown（含代码高亮，已 DOMPurify 清洗） -->
+        <!-- 3) AI 完成/错误/停止：渲染 Markdown（含代码高亮，已 DOMPurify 清洗） -->
         <div v-else class="content markdown-body" v-html="renderedHtml"></div>
       </div>
-      <div class="time">{{ formatTime(message.timestamp) }}</div>
+
+      <!-- 操作行：time + 重新生成 / 重试 -->
+      <div class="meta-row">
+        <span class="time">{{ formatTime(message.timestamp) }}</span>
+        <el-button
+          v-if="showRegenerate"
+          link
+          size="small"
+          class="action-btn"
+          @click="handleRegenerate"
+        >
+          重新生成
+        </el-button>
+        <el-button
+          v-else-if="showRetry"
+          link
+          size="small"
+          class="action-btn retry"
+          @click="handleRegenerate"
+        >
+          重试
+        </el-button>
+      </div>
     </div>
   </div>
 </template>
@@ -137,10 +198,36 @@ function formatTime(ts: number): string {
   }
 }
 
-.time {
+.meta-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
   margin-top: 4px;
+  min-height: 20px;
+}
+
+.time {
   font-size: 12px;
   color: #909399;
+}
+
+.action-btn {
+  font-size: 12px;
+  padding: 0 4px;
+  height: 20px;
+  color: #909399;
+}
+
+.action-btn:hover {
+  color: #3b55e8;
+}
+
+.action-btn.retry {
+  color: #f56c6c;
+}
+
+.action-btn.retry:hover {
+  color: #f89898;
 }
 
 /* ========== Markdown 排版（深度选择器作用于 v-html 子元素） ========== */
