@@ -2,15 +2,17 @@
 import { computed, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Setting } from '@element-plus/icons-vue'
+import { storeToRefs } from 'pinia'
 import { useSettingsStore } from '@/stores/settings'
+import { useChatStore } from '@/stores/chat'
 import { streamChat } from '@/api/chat'
-import type { ChatMessage, ChatSession } from '@/types/chat'
-import { mockMessages, mockSessions } from '@/mock/chatData'
 import SessionList from '@/components/chat/SessionList.vue'
 import ChatWindow from '@/components/chat/ChatWindow.vue'
 import ChatInput from '@/components/chat/ChatInput.vue'
 
 const settings = useSettingsStore()
+const chatStore = useChatStore()
+const { sessions, activeSessionId } = storeToRefs(chatStore)
 
 // 设置弹窗
 const settingsVisible = ref(false)
@@ -32,73 +34,91 @@ function saveSettings() {
   ElMessage.success(key ? '已保存 API Key' : '已清除 API Key，将使用服务端免费额度')
 }
 
-const sessions = ref<ChatSession[]>([...mockSessions])
-const messagesBySession = ref<Record<string, ChatMessage[]>>(
-  JSON.parse(JSON.stringify(mockMessages)),
-)
-const activeSessionId = ref(sessions.value[0]?.id ?? '')
-
-const activeMessages = computed(
-  () => messagesBySession.value[activeSessionId.value] ?? [],
-)
-const activeSessionTitle = computed(
-  () => sessions.value.find((s) => s.id === activeSessionId.value)?.title ?? '',
-)
-
 let messageSeq = 1000
 function genId(prefix: string): string {
   return `${prefix}_${Date.now()}_${messageSeq++}`
 }
 
-function touchSession(id: string) {
-  const session = sessions.value.find((s) => s.id === id)
-  if (session) session.updatedAt = Date.now()
+const activeMessages = computed(() => chatStore.getMessages(activeSessionId.value))
+const activeSessionTitle = computed(
+  () => sessions.value.find((s) => s.id === activeSessionId.value)?.title ?? '',
+)
+
+/** 模块作用域：当前进行中的流（用于切换/删除时中止并标 done） */
+let currentStreamAbort: (() => void) | null = null
+let currentStreamInfo: { sessionId: string; messageId: string } | null = null
+
+/**
+ * 中止当前流并把流式消息标记为 done（非 error）
+ * 切换/删除会话、关闭页面前调用
+ */
+function abortCurrentStream() {
+  if (currentStreamAbort) {
+    currentStreamAbort()
+    currentStreamAbort = null
+  }
+  if (currentStreamInfo) {
+    chatStore.updateMessage(currentStreamInfo.sessionId, currentStreamInfo.messageId, {
+      status: 'done',
+    })
+    currentStreamInfo = null
+  }
 }
 
 function handleSelect(id: string) {
-  activeSessionId.value = id
+  if (id === activeSessionId.value) return
+  abortCurrentStream()
+  chatStore.selectSession(id)
 }
 
 function handleCreate() {
-  const session: ChatSession = {
-    id: genId('s'),
-    title: '新会话',
-    updatedAt: Date.now(),
-  }
-  sessions.value.push(session)
-  messagesBySession.value[session.id] = []
-  activeSessionId.value = session.id
+  abortCurrentStream()
+  chatStore.createSession()
+}
+
+function handleDelete(id: string) {
+  abortCurrentStream()
+  chatStore.deleteSession(id)
 }
 
 const sending = ref(false)
 
 async function handleSend(content: string) {
-  const sessionId = activeSessionId.value
-  if (!sessionId || sending.value) return
+  if (sending.value) return
 
-  messagesBySession.value[sessionId].push({
-    id: genId('m'),
+  const sessionId = chatStore.ensureSession()
+  const now = Date.now()
+
+  // 用户消息：首次时用于自动命名
+  const userMsgId = genId('m')
+  chatStore.appendMessage(sessionId, {
+    id: userMsgId,
     role: 'user',
     content,
-    timestamp: Date.now(),
+    timestamp: now,
   })
-  touchSession(sessionId)
+
+  // 首条用户消息 → 自动命名
+  const session = sessions.value.find((s) => s.id === sessionId)
+  if (session && session.title === '新会话') {
+    chatStore.renameFromFirstUserMessage(sessionId, content)
+  }
 
   sending.value = true
 
-  // 立即 push 一条流式占位消息，后续在 onDelta 里增量追加
+  // 流式占位消息
   const aiMsgId = genId('m')
-  messagesBySession.value[sessionId].push({
+  chatStore.appendMessage(sessionId, {
     id: aiMsgId,
     role: 'assistant',
     content: '',
     timestamp: Date.now(),
     status: 'streaming',
   })
-  touchSession(sessionId)
 
-  // 携带当前会话全部历史消息请求 AI 回复
-  const history = messagesBySession.value[sessionId]
+  // 携带当前会话全部历史消息请求 AI 回复（排除刚 push 的占位）
+  const history = chatStore
+    .getMessages(sessionId)
     .filter((m) => m.id !== aiMsgId)
     .map((m) => ({ role: m.role, content: m.content }))
 
@@ -106,22 +126,25 @@ async function handleSend(content: string) {
   const finish = (status: 'done' | 'error') => {
     if (finished) return
     finished = true
-    const list = messagesBySession.value[sessionId]
-    const target = list.find((m) => m.id === aiMsgId)
-    if (target) target.status = status
-    if (status === 'done') touchSession(sessionId)
+    chatStore.updateMessage(sessionId, aiMsgId, { status })
+    if (currentStreamInfo?.messageId === aiMsgId) {
+      currentStreamInfo = null
+      currentStreamAbort = null
+    }
+    if (status === 'done') chatStore.touchSession(sessionId)
     sending.value = false
   }
 
-  streamChat(history, {
+  currentStreamInfo = { sessionId, messageId: aiMsgId }
+  const controller = streamChat(history, {
     onDelta: (delta) => {
-      const list = messagesBySession.value[sessionId]
-      const target = list.find((m) => m.id === aiMsgId)
+      const target = chatStore.getMessages(sessionId).find((m) => m.id === aiMsgId)
       if (target) target.content += delta
     },
     onDone: () => finish('done'),
     onError: () => finish('error'),
   })
+  currentStreamAbort = controller.abort
 }
 </script>
 
@@ -148,6 +171,7 @@ async function handleSend(content: string) {
         :active-id="activeSessionId"
         @select="handleSelect"
         @create="handleCreate"
+        @delete="handleDelete"
       />
       <ChatWindow :messages="activeMessages" :session-title="activeSessionTitle">
         <ChatInput @send="handleSend" />

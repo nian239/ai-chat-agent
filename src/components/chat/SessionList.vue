@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import { Delete } from '@element-plus/icons-vue'
 import type { ChatSession } from '@/types/chat'
 
 const props = defineProps<{
@@ -10,6 +11,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   select: [id: string]
   create: []
+  delete: [id: string]
 }>()
 
 const sortedSessions = computed(() =>
@@ -24,6 +26,11 @@ function formatTime(ts: number): string {
   const hours = Math.floor(minutes / 60)
   if (hours < 24) return `${hours} 小时前`
   return `${Math.floor(hours / 24)} 天前`
+}
+
+function handleDelete(e: Event, id: string) {
+  e.stopPropagation()
+  emit('delete', id)
 }
 </script>
 
@@ -42,8 +49,27 @@ function formatTime(ts: number): string {
         :class="{ active: session.id === activeId }"
         @click="emit('select', session.id)"
       >
-        <div class="session-title">{{ session.title }}</div>
-        <div class="session-time">{{ formatTime(session.updatedAt) }}</div>
+        <div class="session-main">
+          <div class="session-title">{{ session.title }}</div>
+          <div class="session-time">{{ formatTime(session.updatedAt) }}</div>
+        </div>
+        <el-popconfirm
+          title="确定删除该会话？"
+          confirm-button-text="删除"
+          cancel-button-text="取消"
+          @confirm="handleDelete($event, session.id)"
+        >
+          <template #reference>
+            <el-button
+              class="delete-btn"
+              text
+              circle
+              :icon="Delete"
+              title="删除会话"
+              @click.stop
+            />
+          </template>
+        </el-popconfirm>
       </div>
       <div v-if="sortedSessions.length === 0" class="empty-tip">暂无会话</div>
     </div>
@@ -82,7 +108,10 @@ function formatTime(ts: number): string {
 }
 
 .session-item {
-  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 10px 8px 10px 12px;
   margin-bottom: 4px;
   border-radius: 8px;
   cursor: pointer;
@@ -93,8 +122,17 @@ function formatTime(ts: number): string {
   background-color: #f5f7fa;
 }
 
+.session-item:hover .delete-btn {
+  opacity: 1;
+}
+
 .session-item.active {
   background-color: #ecf0fe;
+}
+
+.session-main {
+  flex: 1;
+  min-width: 0;
 }
 
 .session-title {
@@ -114,6 +152,16 @@ function formatTime(ts: number): string {
   margin-top: 4px;
   font-size: 12px;
   color: #909399;
+}
+
+.delete-btn {
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  color: #909399;
+}
+
+.delete-btn:hover {
+  color: #f56c6c;
 }
 
 .empty-tip {
