@@ -134,7 +134,7 @@ export default async function handler(
       res.setHeader('X-RateLimit-Remaining', '0')
       res.setHeader('X-RateLimit-Reset', String(limit.reset))
       res.status(429).json({
-        message: `今日免费额度（${DAILY_LIMIT} 次）已用完，请填写自己的 API Key 或明天再试`,
+        message: `演示额度已用完，每天 ${DAILY_LIMIT} 次，请明天再来，或在设置中填入自己的 API Key`,
         reset: limit.reset,
       })
       return
