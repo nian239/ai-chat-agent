@@ -24,3 +24,11 @@ pnpm-debug.log*
 
 .vercel
 .codebuddy/
+# AI 助手规划记录
+.codebuddy/
+
+# Vercel 项目配置
+.vercel/
+
+# TypeScript 增量构建缓存
+*.tsbuildinfo
