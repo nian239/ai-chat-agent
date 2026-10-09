@@ -7,6 +7,7 @@ const props = defineProps<{
 }>()
 
 const isUser = computed(() => props.message.role === 'user')
+const isStreaming = computed(() => props.message.status === 'streaming')
 
 function formatTime(ts: number): string {
   return new Date(ts).toLocaleTimeString('zh-CN', {
@@ -23,7 +24,7 @@ function formatTime(ts: number): string {
     </div>
     <div class="bubble-wrap">
       <div class="bubble">
-        <pre class="content">{{ message.content }}</pre>
+        <pre class="content">{{ message.content }}<span v-if="isStreaming" class="cursor">▍</span></pre>
       </div>
       <div class="time">{{ formatTime(message.timestamp) }}</div>
     </div>
@@ -101,6 +102,19 @@ function formatTime(ts: number): string {
   margin: 0;
   font-family: inherit;
   white-space: pre-wrap;
+}
+
+.cursor {
+  display: inline-block;
+  margin-left: 2px;
+  color: #909399;
+  animation: blink 1s steps(2, start) infinite;
+}
+
+@keyframes blink {
+  to {
+    visibility: hidden;
+  }
 }
 
 .time {

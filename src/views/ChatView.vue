@@ -3,7 +3,7 @@ import { computed, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Setting } from '@element-plus/icons-vue'
 import { useSettingsStore } from '@/stores/settings'
-import { sendChat } from '@/api/chat'
+import { streamChat } from '@/api/chat'
 import type { ChatMessage, ChatSession } from '@/types/chat'
 import { mockMessages, mockSessions } from '@/mock/chatData'
 import SessionList from '@/components/chat/SessionList.vue'
@@ -85,25 +85,43 @@ async function handleSend(content: string) {
   touchSession(sessionId)
 
   sending.value = true
-  try {
-    // 携带当前会话全部历史消息请求 AI 回复
-    const history = messagesBySession.value[sessionId].map((m) => ({
-      role: m.role,
-      content: m.content,
-    }))
-    const { content: reply } = await sendChat(history)
-    messagesBySession.value[sessionId].push({
-      id: genId('m'),
-      role: 'assistant',
-      content: reply,
-      timestamp: Date.now(),
-    })
-    touchSession(sessionId)
-  } catch {
-    // 错误提示已由响应拦截器统一处理，这里仅结束 loading
-  } finally {
+
+  // 立即 push 一条流式占位消息，后续在 onDelta 里增量追加
+  const aiMsgId = genId('m')
+  messagesBySession.value[sessionId].push({
+    id: aiMsgId,
+    role: 'assistant',
+    content: '',
+    timestamp: Date.now(),
+    status: 'streaming',
+  })
+  touchSession(sessionId)
+
+  // 携带当前会话全部历史消息请求 AI 回复
+  const history = messagesBySession.value[sessionId]
+    .filter((m) => m.id !== aiMsgId)
+    .map((m) => ({ role: m.role, content: m.content }))
+
+  let finished = false
+  const finish = (status: 'done' | 'error') => {
+    if (finished) return
+    finished = true
+    const list = messagesBySession.value[sessionId]
+    const target = list.find((m) => m.id === aiMsgId)
+    if (target) target.status = status
+    if (status === 'done') touchSession(sessionId)
     sending.value = false
   }
+
+  streamChat(history, {
+    onDelta: (delta) => {
+      const list = messagesBySession.value[sessionId]
+      const target = list.find((m) => m.id === aiMsgId)
+      if (target) target.content += delta
+    },
+    onDone: () => finish('done'),
+    onError: () => finish('error'),
+  })
 }
 </script>
 
