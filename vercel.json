@@ -5,7 +5,10 @@
       "dest": "/api/chat"
     },
     {
-      "src": "/((?!api/).*)",
+      "handle": "filesystem"
+    },
+    {
+      "src": "/(.*)",
       "dest": "/index.html"
     }
   ]
