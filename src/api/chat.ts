@@ -87,7 +87,9 @@ export function streamChat(
         if (status === 401) {
           message = 'API Key 无效，请检查 .env.local 里的 VITE_DEEPSEEK_KEY'
         } else if (status === 429) {
-          message = '请求过于频繁，请稍后再试'
+          // 优先读后端返回的 message（如「演示额度已用完…」）
+          const body = await response.json().catch(() => ({}))
+          message = body.message ?? '请求过于频繁，请稍后再试'
         }
         ElMessage.error(message)
         throw new Error(message)
