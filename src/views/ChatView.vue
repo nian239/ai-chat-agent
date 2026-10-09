@@ -1,16 +1,36 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { useAuthStore } from '@/stores/auth'
+import { Setting } from '@element-plus/icons-vue'
+import { useSettingsStore } from '@/stores/settings'
+import { sendChat } from '@/api/chat'
 import type { ChatMessage, ChatSession } from '@/types/chat'
 import { mockMessages, mockSessions } from '@/mock/chatData'
 import SessionList from '@/components/chat/SessionList.vue'
 import ChatWindow from '@/components/chat/ChatWindow.vue'
 import ChatInput from '@/components/chat/ChatInput.vue'
 
-const router = useRouter()
-const auth = useAuthStore()
+const settings = useSettingsStore()
+
+// 设置弹窗
+const settingsVisible = ref(false)
+const settingsKeyInput = ref('')
+
+function openSettings() {
+  settingsKeyInput.value = settings.userApiKey
+  settingsVisible.value = true
+}
+
+function saveSettings() {
+  const key = settingsKeyInput.value.trim()
+  if (key && !key.startsWith('sk-')) {
+    ElMessage.warning('Key 需以 sk- 开头，请检查后重试')
+    return
+  }
+  settings.setUserKey(key)
+  settingsVisible.value = false
+  ElMessage.success(key ? '已保存 API Key' : '已清除 API Key，将使用服务端免费额度')
+}
 
 const sessions = ref<ChatSession[]>([...mockSessions])
 const messagesBySession = ref<Record<string, ChatMessage[]>>(
@@ -50,9 +70,11 @@ function handleCreate() {
   activeSessionId.value = session.id
 }
 
-function handleSend(content: string) {
+const sending = ref(false)
+
+async function handleSend(content: string) {
   const sessionId = activeSessionId.value
-  if (!sessionId) return
+  if (!sessionId || sending.value) return
 
   messagesBySession.value[sessionId].push({
     id: genId('m'),
@@ -62,22 +84,26 @@ function handleSend(content: string) {
   })
   touchSession(sessionId)
 
-  // TODO: 接入真实 API，先用假数据模拟 AI 回复
-  setTimeout(() => {
+  sending.value = true
+  try {
+    // 携带当前会话全部历史消息请求 AI 回复
+    const history = messagesBySession.value[sessionId].map((m) => ({
+      role: m.role,
+      content: m.content,
+    }))
+    const { content: reply } = await sendChat(history)
     messagesBySession.value[sessionId].push({
       id: genId('m'),
       role: 'assistant',
-      content: `（模拟回复）收到你的消息：「${content}」。真实 AI 接口将在后续接入。`,
+      content: reply,
       timestamp: Date.now(),
     })
     touchSession(sessionId)
-  }, 600)
-}
-
-function handleLogout() {
-  auth.logout()
-  ElMessage.success('已退出登录')
-  router.replace('/login')
+  } catch {
+    // 错误提示已由响应拦截器统一处理，这里仅结束 loading
+  } finally {
+    sending.value = false
+  }
 }
 </script>
 
@@ -89,8 +115,12 @@ function handleLogout() {
         <span class="app-name">AI Chat Agent</span>
       </div>
       <div class="header-right">
-        <el-tag type="success" effect="light" round>已登录</el-tag>
-        <el-button text type="danger" @click="handleLogout">退出登录</el-button>
+        <el-tag :type="settings.hasUserKey ? 'success' : 'info'" effect="light" round>
+          {{ settings.hasUserKey ? '自有 Key' : '免费额度' }}
+        </el-tag>
+        <el-button text circle title="设置" @click="openSettings">
+          <el-icon><Setting /></el-icon>
+        </el-button>
       </div>
     </header>
 
@@ -105,6 +135,25 @@ function handleLogout() {
         <ChatInput @send="handleSend" />
       </ChatWindow>
     </div>
+
+    <!-- 设置弹窗 -->
+    <el-dialog v-model="settingsVisible" title="设置" width="480px">
+      <el-form label-width="90px">
+        <el-form-item label="API Key">
+          <el-input
+            v-model="settingsKeyInput"
+            type="password"
+            show-password
+            placeholder="sk-开头，留空则使用服务端免费额度（每天 5 次）"
+            clearable
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="settingsVisible = false">取消</el-button>
+        <el-button type="primary" @click="saveSettings">保存</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 

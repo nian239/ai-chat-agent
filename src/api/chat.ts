@@ -1,11 +1,15 @@
 import request from './request'
 
-// 示例 API，按需修改
 export interface ChatMessage {
   role: 'user' | 'assistant' | 'system'
   content: string
 }
 
-export function sendMessage(data: ChatMessage) {
-  return request.post<ChatMessage[]>('/chat', data)
+export async function sendChat(messages: ChatMessage[]): Promise<{ content: string }> {
+  const res: any = await request.post('/chat/completions', {
+    model: 'deepseek-chat',
+    messages,
+    stream: false
+  })
+  return { content: res.choices[0].message.content }
 }
