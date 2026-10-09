@@ -3,8 +3,8 @@ import { Readable } from 'node:stream'
 import { Ratelimit } from '@upstash/ratelimit'
 import { Redis } from '@upstash/redis'
 
-const UPSTREAM_URL = 'https://token.sensenova.cn/v1/chat/completions'
-const MODEL = 'sensenova-6.7-flash-lite'
+const UPSTREAM_URL = 'https://api.deepseek.com/chat/completions'
+const MODEL = 'deepseek-chat'
 const DAILY_LIMIT = 5
 const RATE_LIMIT_PREFIX = 'ai-chat:server-key:daily'
 
@@ -121,10 +121,10 @@ export default async function handler(
     apiKey = userKey
   } else {
     // 服务端 Key：每 IP 每天 5 次
-    const serverKey = process.env.SENSENOVA_API_KEY
+    const serverKey = process.env.DEEPSEEK_API_KEY
     if (!serverKey) {
       res.status(500).json({
-        message: '服务端未配置 SENSENOVA_API_KEY，请在设置中填写自己的 API Key',
+        message: '服务端未配置 DEEPSEEK_API_KEY，请在设置中填写自己的 API Key',
       })
       return
     }
