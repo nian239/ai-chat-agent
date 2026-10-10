@@ -1,5 +1,6 @@
 import { fetchEventSource, EventSourceMessage } from '@microsoft/fetch-event-source'
 import { ElMessage } from 'element-plus'
+import { useSettingsStore } from '@/stores/settings'
 
 export interface ChatMessage {
   role: 'user' | 'assistant' | 'system'
@@ -30,8 +31,9 @@ function isAbortError(err: unknown): boolean {
 
 /**
  * 通过 SSE 流式调用 /api/chat/completions
+ * - 自有 Key：X-User-Key 头传给服务端，由其转发上游（不限流）
  * - 本地开发：Vite 代理到 https://api.deepseek.com，Authorization 由 .env.local 的 VITE_DEEPSEEK_KEY 注入
- * - 部署后：vercel.json routes 把 /api/chat/completions 转发到 Vercel Serverless api/chat.ts，Authorization 由其处理
+ * - 免费额度：两者都不带，服务端用自己的 Key 并按 IP 限流
  */
 export function streamChat(
   messages: ChatMessage[],
@@ -41,6 +43,11 @@ export function streamChat(
   currentController?.abort()
   const controller = new AbortController()
   currentController = controller
+
+  // 用户自带 Key（settings store 的 ref，实时读取：改完设置立即生效）
+  // 注意：streamChat 总在用户交互时调用，此时 pinia 已激活，可安全取 store
+  const settings = useSettingsStore()
+  const userKey = settings.userApiKey.trim()
 
   const apiKey = import.meta.env.VITE_DEEPSEEK_KEY ?? ''
   const url = '/api/chat/completions'
@@ -72,6 +79,9 @@ export function streamChat(
     headers: {
       'Content-Type': 'application/json',
       Accept: 'text/event-stream',
+      // 自有 Key：服务端 getUserKey() 优先读此头，命中则不限流、直接透传上游
+      ...(userKey ? { 'X-User-Key': userKey } : {}),
+      // 本地直连 DeepSeek 的 Vite 代理场景（线上服务端会忽略/覆盖它）
       ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
     },
     body: JSON.stringify({
