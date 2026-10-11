@@ -3,15 +3,46 @@ import { ElMessage } from 'element-plus'
 import { useSettingsStore } from '@/stores/settings'
 
 export interface ChatMessage {
-  role: 'user' | 'assistant' | 'system'
+  role: 'user' | 'assistant' | 'system' | 'tool'
   content: string
+  /** assistant 消息携带的工具调用请求（Function Calling 回传给模型用） */
+  tool_calls?: ToolCall[]
+  /** tool 消息对应的调用 id（与 assistant.tool_calls[].id 配对） */
+  tool_call_id?: string
+}
+
+/** OpenAI / DeepSeek 格式的工具调用（流式分片已在 streamChat 内拼接完整） */
+export interface ToolCall {
+  id: string
+  type: 'function'
+  function: {
+    name: string
+    /** JSON 字符串（模型生成，可能为空串） */
+    arguments: string
+  }
+}
+
+/** OpenAI tools 格式的工具定义（与 server/services/tools.ts 的定义对齐） */
+export interface ToolDefinition {
+  type: 'function'
+  function: {
+    name: string
+    description: string
+    /** JSON Schema 参数描述 */
+    parameters: Record<string, unknown>
+  }
 }
 
 export interface StreamChatHandlers {
   /** 每个文本分片回调（可能是空字符串，已过滤） */
   onDelta: (delta: string) => void
-  /** 服务端发完 [DONE] 或正常结束 */
+  /** 服务端发完 [DONE] 或正常结束（未触发工具调用时） */
   onDone: () => void
+  /**
+   * 流结束时模型请求了工具调用（与 onDone 互斥，二者合计恰好一次）
+   * 调用方应执行工具并把 assistant(tool_calls) + tool(result) 回填后再次发起请求
+   */
+  onToolCalls?: (toolCalls: ToolCall[]) => void
   /** 网络/HTTP/解析异常；流已中断，已收到的内容由调用方自行保留 */
   onError: (error: unknown) => void
 }
@@ -38,6 +69,7 @@ function isAbortError(err: unknown): boolean {
 export function streamChat(
   messages: ChatMessage[],
   handlers: StreamChatHandlers,
+  tools?: ToolDefinition[],
 ): StreamChatController {
   // 发送新消息前先中止上一段未完成的流
   currentController?.abort()
@@ -53,7 +85,13 @@ export function streamChat(
   const url = '/api/chat/completions'
 
   /**
-   * 终止态标志位：保证 onDone / onError 合计只通知调用方一次
+   * 流式 tool_calls 累积缓冲：index → { id, name, arguments }
+   * DeepSeek 流式返回时 id / name 在首片到达，arguments 按分片追加，须按 index 拼接
+   */
+  const toolCallBuffer: Array<{ id: string; name: string; arguments: string } | undefined> = []
+
+  /**
+   * 终止态标志位：保证 onDone / onToolCalls / onError 合计只通知调用方一次
    * - finishDone：收到 [DONE]，或服务端没发 [DONE] 直接关流（onclose 兜底）
    * - finishError：网络 / HTTP / 解析异常
    */
@@ -61,7 +99,19 @@ export function streamChat(
   const finishDone = () => {
     if (settled) return
     settled = true
-    handlers.onDone()
+    // 有工具调用请求时分流到 onToolCalls（未注册则按普通结束处理）
+    const toolCalls: ToolCall[] = toolCallBuffer
+      .filter((tc): tc is { id: string; name: string; arguments: string } => Boolean(tc?.name))
+      .map((tc) => ({
+        id: tc.id,
+        type: 'function' as const,
+        function: { name: tc.name, arguments: tc.arguments || '{}' },
+      }))
+    if (toolCalls.length > 0 && handlers.onToolCalls) {
+      handlers.onToolCalls(toolCalls)
+    } else {
+      handlers.onDone()
+    }
   }
   const finishError = (err: unknown) => {
     if (settled) return
@@ -88,6 +138,8 @@ export function streamChat(
       model: 'deepseek-chat',
       messages,
       stream: true,
+      // Function Calling：工具定义随请求透传给 DeepSeek（服务端代理只覆盖 model，其余原样转发）
+      ...(tools && tools.length > 0 ? { tools } : {}),
     }),
     // 非 2xx 抛错，避免 401 等错误响应被当成正常流处理
     onopen: async (response) => {
@@ -125,6 +177,22 @@ export function streamChat(
         data?.choices?.[0]?.delta?.content
       if (typeof delta === 'string' && delta.length > 0) {
         handlers.onDelta(delta)
+      }
+      // Function Calling：按 index 累积 tool_calls 分片
+      const rawToolCalls = data?.choices?.[0]?.delta?.tool_calls
+      if (Array.isArray(rawToolCalls)) {
+        for (const tc of rawToolCalls) {
+          const idx = typeof tc?.index === 'number' ? tc.index : 0
+          const slot =
+            toolCallBuffer[idx] ?? (toolCallBuffer[idx] = { id: '', name: '', arguments: '' })
+          if (typeof tc?.id === 'string' && tc.id) slot.id = tc.id
+          if (typeof tc?.function?.name === 'string' && tc.function.name) {
+            slot.name = tc.function.name
+          }
+          if (typeof tc?.function?.arguments === 'string') {
+            slot.arguments += tc.function.arguments
+          }
+        }
       }
     },
     onerror: (err) => {

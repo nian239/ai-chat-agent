@@ -18,6 +18,7 @@
 - **IP 限流**：`@upstash/ratelimit` 实现每 IP 每天 5 次，超限返回 429
 - **双模式切换**：默认使用演示额度，用户也可在设置中填入自己的 API Key，不受限流
 - **本地 Express + SQLite 模式**：开发环境走 `server/`（Express + better-sqlite3），会话与消息持久化到 SQLite，与线上 Vercel Serverless 共存
+- **RAG 知识库**：本地开发模式（DEV）可用，上传 TXT 文档（自动切分 500 字/段、重叠 50 字），调用硅基流动 `BAAI/bge-m3` 生成向量存入内存向量库；有文档时聊天自动检索 top-3 片段拼入 System Prompt，回答下方展示引用来源（文档名、片段号、相似度），来源随消息持久化
 
 ---
 
@@ -33,6 +34,7 @@
 | Markdown | markdown-it + highlight.js + DOMPurify |
 | 后端 | Vercel Serverless Function（线上）/ Express + better-sqlite3（本地） |
 | 限流 | Upstash Redis + `@upstash/ratelimit` |
+| Embedding（RAG） | 硅基流动 SiliconFlow · BAAI/bge-m3（1024 维，免费） |
 | 部署 | Vercel |
 
 ---
@@ -50,6 +52,9 @@ npm install
 # 创建 .env.local，填入服务端使用的 DeepSeek API Key
 # （本地不再直连上游，VITE_DEEPSEEK_KEY 直连模式已由 Express 取代）
 echo "DEEPSEEK_API_KEY=sk-你的Key" > .env.local
+
+# RAG 知识库需要（可选）：硅基流动 API Key，用于 BAAI/bge-m3 向量化
+echo "SILICONFLOW_API_KEY=sk-你的硅基流动Key" >> .env.local
 
 # 一键并发启动：Express(:3000) + Vite(:5173)，浏览器自动打开
 npm run dev
@@ -70,3 +75,34 @@ npm run dev:web  # 仅前端（依赖 Express 已在跑）
 npm run typecheck:server
 npx vue-tsc -b
 ```
+
+---
+
+## 📚 RAG 知识库（本地开发模式）
+
+侧栏「知识库」入口：上传 TXT → 切分 → 向量化 → 检索 → 引用来源，全流程由本地 Express 完成。
+
+**处理流程**：
+
+1. 前端上传 TXT（UTF-8 严格解码，失败自动回退 GBK，兼容 Windows 中文记事本）
+2. 后端切分：500 字/段，相邻段重叠 50 字
+3. 调用硅基流动 Embedding API（`BAAI/bge-m3`，1024 维，分批 16 条/次）生成向量
+4. 存入内存向量库（服务重启后丢失，重新上传即可）
+5. 用户提问 → 问题向量化 → 余弦相似度检索 top-3 片段 → 拼入 System Prompt
+6. AI 回答时标注引用编号（如 `[1] [2]`），消息下方展示引用来源（文档名、片段号、相似度），并随消息持久化到 SQLite
+
+**API 设计**：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/documents/upload` | 上传文档（JSON：`{ filename, content }`），切分 + 向量化 + 入库 |
+| GET | `/api/documents` | 文档列表（名称、字数、段数、时间） |
+| DELETE | `/api/documents/:id` | 删除文档（级联删除其片段向量） |
+| POST | `/api/rag/query` | 知识库检索：`{ question }` → top-3 片段 |
+
+**注意事项**：
+
+- 依赖 `.env.local` 中的 `SILICONFLOW_API_KEY`，未配置时上传/检索返回明确错误提示
+- 仅本地开发模式（DEV）可用：向量存 Express 内存，线上 Vercel Serverless 无状态（后续可升级 Upstash Vector）
+- 目前仅支持 TXT（单文件 ≤ 4MB），PDF 后续支持
+- 检索失败时自动降级为普通聊天，不打断回答

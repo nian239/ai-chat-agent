@@ -11,6 +11,15 @@ export interface MessageSource {
   score: number
 }
 
+/** 工具调用记录（Function Calling） */
+export interface ToolUse {
+  name: string
+  /** 调用参数（模型生成 JSON 解析后的值，以对象为主） */
+  args: unknown
+  /** 工具返回（JSON 字符串）；空串表示调用中（用于 UI 加载态） */
+  result: string
+}
+
 export interface ChatMessage {
   id: string
   role: MessageRole
@@ -27,6 +36,8 @@ export interface ChatMessage {
   status?: MessageStatus
   /** RAG 引用来源（仅 assistant 消息，走知识库回答时携带） */
   sources?: MessageSource[]
+  /** 工具调用记录（仅 assistant 消息，Function Calling 时携带） */
+  toolUses?: ToolUse[]
 }
 
 export interface ChatSession {

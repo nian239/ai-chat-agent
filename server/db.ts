@@ -30,7 +30,8 @@ db.exec(`
     content    TEXT NOT NULL DEFAULT '',
     status     TEXT CHECK (status IN ('streaming', 'done', 'error', 'stopped')),
     created_at INTEGER NOT NULL,
-    sources    TEXT
+    sources    TEXT,
+    tool_uses  TEXT
   );
 
   CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
@@ -40,6 +41,13 @@ db.exec(`
 // 新库已含该列，ALTER 会因重复列报错，捕获后忽略
 try {
   db.exec('ALTER TABLE messages ADD COLUMN sources TEXT')
+} catch {
+  // 列已存在，无需迁移
+}
+
+// 旧库迁移：补 tool_uses 列（JSON 字符串，存 Function Calling 工具调用记录）
+try {
+  db.exec('ALTER TABLE messages ADD COLUMN tool_uses TEXT')
 } catch {
   // 列已存在，无需迁移
 }
@@ -82,6 +90,35 @@ export function parseSources(raw: unknown): MessageSource[] | undefined | null {
   return result
 }
 
+/** 工具调用记录（与前端 src/types/chat.ts 的 ToolUse 对齐） */
+export interface ToolUseRecord {
+  name: string
+  /** 调用参数（JSON 任意值，以对象为主） */
+  args: unknown
+  /** 工具返回（JSON 字符串）；空串表示调用中 */
+  result: string
+}
+
+/**
+ * 校验并解析请求体中的 toolUses 字段
+ * - undefined / null → undefined（未传）
+ * - 合法数组 → ToolUseRecord[]
+ * - 类型不合法 → null（路由层转 400）
+ */
+export function parseToolUses(raw: unknown): ToolUseRecord[] | undefined | null {
+  if (raw === undefined || raw === null) return undefined
+  if (!Array.isArray(raw)) return null
+  const result: ToolUseRecord[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') return null
+    const it = item as Record<string, unknown>
+    if (typeof it.name !== 'string' || !it.name.trim()) return null
+    if (typeof it.result !== 'string') return null
+    result.push({ name: it.name, args: it.args, result: it.result })
+  }
+  return result
+}
+
 export interface MessageInput {
   /** 缺省时服务端生成 */
   id?: string
@@ -91,6 +128,7 @@ export interface MessageInput {
   /** 缺省时取当前时间 */
   timestamp?: number
   sources?: MessageSource[]
+  toolUses?: ToolUseRecord[]
 }
 
 export interface MessageDTO {
@@ -101,6 +139,7 @@ export interface MessageDTO {
   /** 与前端约定：无值视为 done */
   status?: 'streaming' | 'done' | 'error' | 'stopped'
   sources?: MessageSource[]
+  toolUses?: ToolUseRecord[]
 }
 
 // ---------- 内部行类型 ----------
@@ -120,6 +159,7 @@ interface MessageRow {
   status: string | null
   created_at: number
   sources: string | null
+  tool_uses: string | null
 }
 
 // ---------- 预编译语句（better-sqlite3 同步 API，全部语句复用） ----------
@@ -138,14 +178,15 @@ const listMessagesStmt = db.prepare(
 )
 const getMessageStmt = db.prepare('SELECT * FROM messages WHERE session_id = ? AND id = ?')
 const upsertMessageStmt = db.prepare(`
-  INSERT INTO messages (id, session_id, role, content, status, created_at, sources)
-  VALUES (@id, @session_id, @role, @content, @status, @created_at, @sources)
+  INSERT INTO messages (id, session_id, role, content, status, created_at, sources, tool_uses)
+  VALUES (@id, @session_id, @role, @content, @status, @created_at, @sources, @tool_uses)
   ON CONFLICT (id) DO UPDATE SET
     session_id = excluded.session_id,
     role       = excluded.role,
     content    = excluded.content,
     status     = excluded.status,
-    sources    = excluded.sources
+    sources    = excluded.sources,
+    tool_uses  = excluded.tool_uses
 `)
 const deleteMessageStmt = db.prepare('DELETE FROM messages WHERE session_id = ? AND id = ?')
 
@@ -176,6 +217,15 @@ function toMessageDTO(row: MessageRow): MessageDTO {
       // 脏数据忽略，不影响消息主体
     }
   }
+  let toolUses: ToolUseRecord[] | undefined
+  if (row.tool_uses) {
+    try {
+      const parsed = JSON.parse(row.tool_uses)
+      if (Array.isArray(parsed)) toolUses = parsed as ToolUseRecord[]
+    } catch {
+      // 脏数据忽略，不影响消息主体
+    }
+  }
   return {
     id: row.id,
     role: row.role as MessageDTO['role'],
@@ -183,6 +233,7 @@ function toMessageDTO(row: MessageRow): MessageDTO {
     timestamp: row.created_at,
     ...(row.status ? { status: row.status as MessageDTO['status'] } : {}),
     ...(sources ? { sources } : {}),
+    ...(toolUses ? { toolUses } : {}),
   }
 }
 
@@ -254,6 +305,7 @@ export function upsertMessage(sessionId: string, msg: MessageInput): MessageDTO 
       status: msg.status ?? null,
       created_at: createdAt,
       sources: msg.sources ? JSON.stringify(msg.sources) : null,
+      tool_uses: msg.toolUses ? JSON.stringify(msg.toolUses) : null,
     })
     touchSessionStmt.run(now, sessionId)
   })

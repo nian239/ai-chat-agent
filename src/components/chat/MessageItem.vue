@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, inject } from 'vue'
+import { CircleCheck, CircleClose, Loading } from '@element-plus/icons-vue'
 import 'highlight.js/styles/github.css'
 import type { ChatMessage } from '@/types/chat'
 import { renderMarkdown } from '@/utils/markdown'
@@ -70,6 +71,34 @@ function formatTime(ts: number): string {
 function formatScore(score: number): string {
   return `${Math.max(0, Math.round(score * 100))}%`
 }
+
+/** JSON 值格式化展示：字符串先尝试解析再美化，失败时原样展示 */
+function formatJson(value: unknown): string {
+  if (value === null || value === undefined) return '(空)'
+  if (typeof value === 'string') {
+    try {
+      return JSON.stringify(JSON.parse(value), null, 2)
+    } catch {
+      return value
+    }
+  }
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return String(value)
+  }
+}
+
+/** 工具结果是否为错误（执行失败时以 { error } JSON 回填） */
+function isToolError(result: string): boolean {
+  if (!result) return false
+  try {
+    const parsed = JSON.parse(result) as unknown
+    return typeof parsed === 'object' && parsed !== null && 'error' in parsed
+  } catch {
+    return false
+  }
+}
 </script>
 
 <template>
@@ -89,6 +118,43 @@ function formatScore(score: number): string {
 
         <!-- 3) AI 完成/错误/停止：渲染 Markdown（含代码高亮，已 DOMPurify 清洗） -->
         <div v-else class="content markdown-body" v-html="renderedHtml"></div>
+      </div>
+
+      <!-- 工具调用卡片（Function Calling）：result 为空串表示调用中 -->
+      <div v-if="message.toolUses && message.toolUses.length > 0" class="tool-uses">
+        <div v-for="(use, i) in message.toolUses" :key="i" class="tool-item">
+          <div class="tool-head">
+            <el-icon v-if="!use.result" class="tool-icon is-loading"><Loading /></el-icon>
+            <el-icon v-else-if="isToolError(use.result)" class="tool-icon error"><CircleClose /></el-icon>
+            <el-icon v-else class="tool-icon success"><CircleCheck /></el-icon>
+            <span class="tool-name">{{ use.name }}</span>
+            <span v-if="!use.result" class="tool-status pending">正在调用工具…</span>
+            <span
+              v-else
+              class="tool-status"
+              :class="isToolError(use.result) ? 'failed' : 'ok'"
+            >
+              {{ isToolError(use.result) ? '调用失败' : '调用完成' }}
+            </span>
+          </div>
+          <el-collapse class="tool-collapse">
+            <el-collapse-item title="参数与结果">
+              <div class="tool-detail">
+                <div class="tool-row">
+                  <span class="tool-label">参数</span>
+                  <pre class="tool-json">{{ formatJson(use.args) }}</pre>
+                </div>
+                <div v-if="use.result" class="tool-row">
+                  <span class="tool-label">结果</span>
+                  <pre
+                    class="tool-json"
+                    :class="{ 'tool-json-error': isToolError(use.result) }"
+                  >{{ formatJson(use.result) }}</pre>
+                </div>
+              </div>
+            </el-collapse-item>
+          </el-collapse>
+        </div>
       </div>
 
       <!-- RAG 引用来源（仅走知识库回答的 assistant 消息携带） -->
@@ -224,6 +290,125 @@ function formatScore(score: number): string {
   gap: 4px;
   margin-top: 4px;
   min-height: 20px;
+}
+
+/* ========== 工具调用卡片（Function Calling） ========== */
+.tool-uses {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.tool-item {
+  padding: 8px 12px;
+  font-size: 12px;
+  background: #f5f7fa;
+  border: 1px solid #ebeef5;
+  border-radius: 8px;
+}
+
+.tool-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tool-icon {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.tool-icon.success {
+  color: #67c23a;
+}
+
+.tool-icon.error {
+  color: #f56c6c;
+}
+
+.tool-name {
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-weight: 600;
+  color: #303133;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-status {
+  flex-shrink: 0;
+  color: #909399;
+}
+
+.tool-status.pending {
+  color: #3b55e8;
+}
+
+.tool-status.ok {
+  color: #67c23a;
+}
+
+.tool-status.failed {
+  color: #f56c6c;
+}
+
+.tool-collapse {
+  margin-top: 2px;
+  border-top: none;
+}
+
+.tool-collapse :deep(.el-collapse-item__header) {
+  height: 26px;
+  line-height: 26px;
+  font-size: 12px;
+  color: #909399;
+  background: transparent;
+  border-bottom: none;
+}
+
+.tool-collapse :deep(.el-collapse-item__wrap) {
+  background: transparent;
+  border-bottom: none;
+}
+
+.tool-collapse :deep(.el-collapse-item__content) {
+  padding-bottom: 4px;
+}
+
+.tool-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tool-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tool-label {
+  color: #909399;
+}
+
+.tool-json {
+  margin: 0;
+  padding: 6px 8px;
+  font-size: 12px;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  background: #ffffff;
+  border: 1px solid #ebeef5;
+  border-radius: 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.tool-json-error {
+  color: #f56c6c;
 }
 
 /* ========== RAG 引用来源 ========== */

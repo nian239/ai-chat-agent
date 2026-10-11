@@ -10,6 +10,7 @@ import { sessionRouter } from './routes/sessions'
 import { messageRouter } from './routes/messages'
 import { chatRouter } from './routes/chat'
 import { documentRouter } from './routes/documents'
+import { toolRouter } from './routes/tools'
 
 const app = express()
 
@@ -21,6 +22,7 @@ app.use(sessionRouter)
 app.use(messageRouter)
 app.use(chatRouter)
 app.use(documentRouter)
+app.use(toolRouter)
 
 app.use(errorHandler)
 

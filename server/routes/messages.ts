@@ -4,6 +4,7 @@ import {
   getSession,
   listMessages,
   parseSources,
+  parseToolUses,
   upsertMessage,
   type MessageInput,
 } from '../db'
@@ -40,6 +41,11 @@ function parseMessageBody(
     return { ok: false, message: 'sources 必须是 { docName, chunkIndex, score } 数组' }
   }
 
+  const toolUses = parseToolUses(b.toolUses)
+  if (toolUses === null) {
+    return { ok: false, message: 'toolUses 必须是 { name, args, result } 数组' }
+  }
+
   return {
     ok: true,
     value: {
@@ -49,6 +55,7 @@ function parseMessageBody(
       status: b.status === undefined ? undefined : (String(b.status) as MessageInput['status']),
       timestamp: typeof b.timestamp === 'number' ? b.timestamp : undefined,
       ...(sources ? { sources } : {}),
+      ...(toolUses ? { toolUses } : {}),
     },
   }
 }

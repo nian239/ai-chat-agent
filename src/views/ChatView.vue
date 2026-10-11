@@ -6,9 +6,10 @@ import { storeToRefs } from 'pinia'
 import { useSettingsStore } from '@/stores/settings'
 import { useChatStore } from '@/stores/chat'
 import { useKnowledgeStore } from '@/stores/knowledge'
-import { streamChat, type ChatMessage } from '@/api/chat'
+import { streamChat, type ChatMessage, type ToolCall, type ToolDefinition } from '@/api/chat'
 import { queryKnowledge, type RetrievedChunk } from '@/api/documents'
-import type { MessageSource } from '@/types/chat'
+import { listTools, executeTool as executeToolApi } from '@/api/tools'
+import type { MessageSource, ToolUse } from '@/types/chat'
 import SessionList from '@/components/chat/SessionList.vue'
 import ChatWindow from '@/components/chat/ChatWindow.vue'
 import ChatInput from '@/components/chat/ChatInput.vue'
@@ -21,6 +22,21 @@ const { sessions, activeSessionId } = storeToRefs(chatStore)
 // 知识库（RAG）：DEV 走本地 Express 内存向量库
 const knowledge = useKnowledgeStore()
 const knowledgeVisible = ref(false)
+
+// Function Calling：工具定义（服务端 server/services/tools.ts 单一来源，启动时拉取）
+const tools = ref<ToolDefinition[]>([])
+
+/** 工具调用轮次上限：防模型连续调用形成死循环 */
+const MAX_TOOL_ROUNDS = 3
+
+async function loadTools() {
+  try {
+    tools.value = await listTools()
+  } catch (err) {
+    // PROD 线上无 /api/tools 端点（Vercel 无状态），降级为不带 tools 的普通聊天
+    console.warn('[ChatView] 工具定义拉取失败，本次不带 tools:', err)
+  }
+}
 
 // 设置弹窗
 const settingsVisible = ref(false)
@@ -65,6 +81,7 @@ const chatReady = computed(() => chatStore.ready)
 onMounted(() => {
   void chatStore.init()
   void knowledge.init()
+  void loadTools()
 })
 
 /** 模块作用域：当前进行中的流（用于切换/删除时中止并标 done） */
@@ -120,12 +137,44 @@ function buildRagPrompt(chunks: RetrievedChunk[]): string {
   ].join('\n')
 }
 
+/** 安全解析模型生成的参数 JSON（失败时返回原始字符串） */
+function safeParseJson(text: string): unknown {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return text
+  }
+}
+
+/** 执行工具（永不抛错）：失败时以 { error } JSON 回填，让模型自行向用户解释 */
+async function executeToolSafe(call: ToolCall): Promise<string> {
+  try {
+    return await executeToolApi(call.function.name, call.function.arguments || '{}')
+  } catch (err) {
+    return JSON.stringify({ error: err instanceof Error ? err.message : String(err) })
+  }
+}
+
+/** 把工具调用记录同步到消息（UI 立即刷新；消息已终态时附带 status 触发一次落库快照） */
+function syncToolUses(sessionId: string, messageId: string, uses: ToolUse[]) {
+  const target = chatStore.getMessages(sessionId).find((m) => m.id === messageId)
+  if (!target) return
+  const patch: Parameters<typeof chatStore.updateMessage>[2] = {
+    toolUses: uses.map((u) => ({ ...u })),
+  }
+  if (target.status && target.status !== 'streaming') {
+    patch.status = target.status
+  }
+  chatStore.updateMessage(sessionId, messageId, patch)
+}
+
 /**
  * 启动一次流式回复
  * - 被 handleSend（用户发新消息后）和 regenerate（删最后 AI 消息后）共用
  * - history 自动排除最后一条 streaming 状态的占位消息
  * - finish() 加 status 守卫：stopGeneration 已设 'stopped' 时，abort 触发的 finish('error') 不覆盖
  * - 有知识库文档时先做 RAG 检索（await 期间占位消息已存在，输入保持禁用）
+ * - 模型返回 tool_calls 时：执行工具 → 回填上下文 → 下一轮流式（上限 MAX_TOOL_ROUNDS 轮）
  */
 async function startStream(sessionId: string) {
   // 流式占位消息
@@ -170,9 +219,12 @@ async function startStream(sessionId: string) {
     }
   }
 
+  // ---------- Function Calling：工具调用记录（随终态一起落库） ----------
+  let toolUses: ToolUse[] | null = null
+
   /**
    * 收尾：只有流真正结束才会被调用
-   * - api 层 settled 标志保证 onDone / onError 合计只通知一次，且主动 abort 不触发
+   * - api 层 settled 标志保证 onDone / onToolCalls / onError 合计只通知一次，且主动 abort 不触发
    * - 本层 finished 再做一道保险，防止重复收尾
    */
   let finished = false
@@ -188,6 +240,10 @@ async function startStream(sessionId: string) {
         status,
         // RAG 引用来源随终态一起写入（DEV 落库 / PROD 随 localStorage 持久化）
         ...(status === 'done' && ragSources ? { sources: ragSources } : {}),
+        // 工具调用记录（含参数与结果）随终态一起写入
+        ...(toolUses && toolUses.length > 0
+          ? { toolUses: toolUses.map((u) => ({ ...u })) }
+          : {}),
       })
     }
     if (currentStreamInfo?.messageId === aiMsgId) {
@@ -199,15 +255,76 @@ async function startStream(sessionId: string) {
   }
 
   currentStreamInfo = { sessionId, messageId: aiMsgId }
-  const controller = streamChat(history, {
-    onDelta: (delta) => {
-      const target = chatStore.getMessages(sessionId).find((m) => m.id === aiMsgId)
-      if (target) target.content += delta
-    },
-    onDone: () => finish('done'),
-    onError: () => finish('error'),
-  })
-  currentStreamAbort = controller.abort
+
+  // ---------- Function Calling：工具循环 ----------
+  // workingMessages 在轮次间累积：assistant(tool_calls) + tool(result) 回填给模型
+  const workingMessages = [...history]
+  let rounds = 0
+
+  /** 发起一轮流式请求；forceNoTools 为 true 时不带工具（达到轮次上限后强制模型给出最终回答） */
+  const runRound = (forceNoTools = false) => {
+    const controller = streamChat(
+      workingMessages,
+      {
+        onDelta: (delta) => {
+          const target = chatStore.getMessages(sessionId).find((m) => m.id === aiMsgId)
+          if (target) target.content += delta
+        },
+        // 模型请求调用工具：执行 → 回填 → 下一轮（fire-and-forget，流本身已结束）
+        onToolCalls: (toolCalls) => {
+          void handleToolCalls(toolCalls)
+        },
+        onDone: () => finish('done'),
+        onError: () => finish('error'),
+      },
+      !forceNoTools && tools.value.length > 0 ? tools.value : undefined,
+    )
+    currentStreamAbort = controller.abort
+  }
+
+  /** 处理模型的工具调用请求：执行全部工具后回填上下文并发起下一轮 */
+  const handleToolCalls = async (toolCalls: ToolCall[]) => {
+    // 1) 先写入「调用中」记录（result 为空串），UI 立即展示加载态
+    if (!toolUses) toolUses = []
+    const uses: ToolUse[] = toolCalls.map((c) => ({
+      name: c.function.name,
+      args: safeParseJson(c.function.arguments || '{}'),
+      result: '',
+    }))
+    toolUses.push(...uses)
+    syncToolUses(sessionId, aiMsgId, toolUses)
+
+    // 2) 逐个执行并回填结果（串行，避免同会话并发写）
+    for (let i = 0; i < toolCalls.length; i++) {
+      uses[i].result = await executeToolSafe(toolCalls[i])
+      syncToolUses(sessionId, aiMsgId, toolUses)
+    }
+
+    // 3) 停止守卫：用户在工具执行期间点了停止 → 终止，不再发下一轮
+    const target = chatStore.getMessages(sessionId).find((m) => m.id === aiMsgId)
+    if (!target || target.status !== 'streaming') return
+
+    // 4) 回填上下文：assistant(tool_calls) + 每个调用的 tool(result)
+    workingMessages.push({ role: 'assistant', content: '', tool_calls: toolCalls })
+    for (let i = 0; i < toolCalls.length; i++) {
+      workingMessages.push({
+        role: 'tool',
+        tool_call_id: toolCalls[i].id,
+        content: uses[i].result,
+      })
+    }
+
+    // 5) 轮次上限：最后不带 tools 请求一次，强制模型给出最终回答
+    rounds += 1
+    if (rounds >= MAX_TOOL_ROUNDS) {
+      console.warn(`[ChatView] 工具调用达到 ${MAX_TOOL_ROUNDS} 轮上限，最后一轮不带工具`)
+      runRound(true)
+      return
+    }
+    runRound()
+  }
+
+  runRound()
 }
 
 async function handleSend(content: string) {
