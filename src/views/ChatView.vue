@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, provide, ref, watchEffect } from 'vue'
+import { computed, onBeforeUnmount, onMounted, provide, ref, watchEffect } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Setting } from '@element-plus/icons-vue'
 import { storeToRefs } from 'pinia'
@@ -46,6 +46,17 @@ const activeSessionTitle = computed(
 
 /** 是否正在流式生成（用于禁用输入框/发送按钮） */
 const sending = ref(false)
+
+/**
+ * DEV：服务端存储（SQLite）加载完成标志
+ * - init() 完成前禁用输入，避免 ensureSession 在空状态下重复建会话
+ * - PROD 恒为 true（localStorage 同步初始化）
+ */
+const chatReady = computed(() => chatStore.ready)
+
+onMounted(() => {
+  void chatStore.init()
+})
 
 /** 模块作用域：当前进行中的流（用于切换/删除时中止并标 done） */
 let currentStreamAbort: (() => void) | null = null
@@ -124,8 +135,9 @@ function startStream(sessionId: string) {
     const list = chatStore.getMessages(sessionId)
     const target = list.find((m) => m.id === aiMsgId)
     // 守卫：若 stopGeneration 已把 status 改为 'stopped'，则不再覆盖
+    // 走 updateMessage（而非直接改字段）：DEV 下终态 patch 是 AI 消息落库的唯一触发点
     if (target && target.status === 'streaming') {
-      target.status = status
+      chatStore.updateMessage(sessionId, aiMsgId, { status })
     }
     if (currentStreamInfo?.messageId === aiMsgId) {
       currentStreamInfo = null
@@ -209,7 +221,8 @@ function regenerate() {
   // 找最后一条 assistant 消息
   for (let i = list.length - 1; i >= 0; i--) {
     if (list[i].role === 'assistant') {
-      list.splice(i, 1)
+      // 走 store action：DEV 下同步删除 SQLite 里的对应消息
+      chatStore.deleteMessage(sessionId, list[i].id)
       break
     }
   }
@@ -276,7 +289,7 @@ provide('chatActions', {
       />
       <ChatWindow :messages="activeMessages" :session-title="activeSessionTitle">
         <ChatInput
-          :disabled="sending"
+          :disabled="sending || !chatReady"
           :streaming="sending"
           @send="handleSend"
           @stop="stopGeneration"

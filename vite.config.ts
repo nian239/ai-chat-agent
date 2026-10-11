@@ -13,11 +13,14 @@ export default defineConfig({
   server: {
     port: 5173,
     open: true,
+    // DEV 统一走本地 Express（server/，端口 3000）：
+    // - /api/chat/completions → 复用 api/chat.ts handler（SSE 流式透传）
+    // - /api/sessions、/api/sessions/:id/messages → SQLite CRUD
+    // 原「直连 DeepSeek + rewrite 去前缀」模式由 Express 统一取代，无需 rewrite
     proxy: {
       '/api': {
-        target: 'https://api.deepseek.com',
+        target: 'http://localhost:3000',
         changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api/, ''),
       },
     },
   },

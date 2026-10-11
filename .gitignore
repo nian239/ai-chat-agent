@@ -32,3 +32,6 @@ pnpm-debug.log*
 
 # TypeScript 增量构建缓存
 *.tsbuildinfo
+
+# 本地 Express 服务的 SQLite 数据（含 WAL/SHM 临时文件）
+server/data/

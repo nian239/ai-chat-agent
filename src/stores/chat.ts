@@ -1,6 +1,7 @@
 import { ref, watch } from 'vue'
 import { defineStore } from 'pinia'
 import type { ChatMessage, ChatSession } from '@/types/chat'
+import { getStorage, serverStorageEnabled } from '@/api/storage'
 
 const STORAGE_KEY = 'ai_chat_state_v1'
 
@@ -74,12 +75,31 @@ function loadFromStorage(): {
 }
 
 export const useChatStore = defineStore('chat', () => {
-  const initial = loadFromStorage()
+  /**
+   * 存储模式：
+   * - DEV：Express + SQLite（serverStorageEnabled = true），init() 异步加载，
+   *   写操作同步改内存态后 fire-and-forget 同步到服务端
+   * - PROD：内置 localStorage 持久化，旧逻辑逐字保留（loadFromStorage + watch persist）
+   */
+  const useServer = serverStorageEnabled
+
+  const initial = useServer
+    ? { sessions: [] as ChatSession[], messagesMap: {} as Record<string, ChatMessage[]>, activeSessionId: '', sessionSeq: 0 }
+    : loadFromStorage()
   sessionSeq = initial.sessionSeq
 
   const sessions = ref<ChatSession[]>(initial.sessions)
   const messagesMap = ref<Record<string, ChatMessage[]>>(initial.messagesMap)
   const activeSessionId = ref<string>(initial.activeSessionId)
+
+  /**
+   * DEV：服务端数据加载完成标志
+   * - ChatView 在 init() 完成前禁用输入，避免 ensureSession 在空状态重复建会话
+   * - PROD 恒为 true（同步初始化，无需等待）
+   */
+  const ready = ref(!useServer)
+
+  // ---------- PROD：localStorage 持久化（旧逻辑，逐字保留） ----------
 
   function persist() {
     if (typeof localStorage === 'undefined') return
@@ -96,7 +116,47 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  watch([sessions, messagesMap, activeSessionId], persist, { deep: true })
+  if (!useServer) {
+    watch([sessions, messagesMap, activeSessionId], persist, { deep: true })
+  }
+
+  // ---------- DEV：服务端读写 ----------
+
+  /** fire-and-forget：写服务端失败只告警，不打断 UI */
+  function sync(fn: () => Promise<unknown>, label: string): void {
+    fn().catch((err) => {
+      console.warn(`[chat store] ${label} 同步到服务端失败:`, err)
+    })
+  }
+
+  /** DEV：异步初始化——从 SQLite 拉取全部会话与消息（ChatView onMounted 调用） */
+  async function init(): Promise<void> {
+    if (!useServer || ready.value) return
+    const storage = getStorage()
+    try {
+      const remoteSessions = await storage.listSessions()
+      const messageLists = await Promise.all(
+        remoteSessions.map((s) =>
+          storage.listMessages(s.id).catch(() => [] as ChatMessage[]),
+        ),
+      )
+      sessions.value = remoteSessions
+      const map: Record<string, ChatMessage[]> = {}
+      remoteSessions.forEach((s, i) => {
+        map[s.id] = messageLists[i] ?? []
+      })
+      messagesMap.value = map
+      // 服务端按 updated_at 倒序，默认激活最近活跃的会话
+      activeSessionId.value = remoteSessions[0]?.id ?? ''
+      ready.value = true
+    } catch (err) {
+      // Express 未启动等情况：置 ready 放开 UI（后续写操作会继续尝试并告警）
+      console.warn('[chat store] 服务端存储初始化失败（Express 是否已启动？）:', err)
+      ready.value = true
+    }
+  }
+
+  // ---------- 通用内存态操作（两种模式共用） ----------
 
   /** 读取某会话消息（返回响应式引用，不存在返回空数组） */
   function getMessages(sessionId: string): ChatMessage[] {
@@ -112,7 +172,7 @@ export const useChatStore = defineStore('chat', () => {
     session.updatedAt = Date.now()
   }
 
-  /** 新建会话并激活，返回 id */
+  /** 新建会话并激活，返回 id（id 客户端生成，DEV 下随 POST 传给服务端） */
   function createSession(): string {
     const now = Date.now()
     const id = nextSessionId()
@@ -125,6 +185,9 @@ export const useChatStore = defineStore('chat', () => {
     sessions.value.push(session)
     messagesMap.value[id] = []
     activeSessionId.value = id
+    if (useServer) {
+      sync(() => getStorage().createSession(session), 'createSession')
+    }
     return id
   }
 
@@ -147,6 +210,9 @@ export const useChatStore = defineStore('chat', () => {
     if (activeSessionId.value === id) {
       activeSessionId.value = sessions.value[0]?.id ?? ''
     }
+    if (useServer) {
+      sync(() => getStorage().deleteSession(id), 'deleteSession')
+    }
     return activeSessionId.value
   }
 
@@ -158,16 +224,27 @@ export const useChatStore = defineStore('chat', () => {
     return createSession()
   }
 
-  /** 追加消息到指定会话，并 touchSession */
+  /**
+   * 追加消息到指定会话，并 touchSession
+   * DEV 落库时机：终态消息（用户消息 / 无 streaming 状态）立即 POST；
+   * streaming 占位不落库——流结束后由 updateMessage 一次性 upsert
+   */
   function appendMessage(sessionId: string, message: ChatMessage) {
     if (!messagesMap.value[sessionId]) {
       messagesMap.value[sessionId] = []
     }
     messagesMap.value[sessionId].push(message)
     touchSession(sessionId)
+    if (useServer && message.status !== 'streaming') {
+      sync(() => getStorage().appendMessage(sessionId, message), 'appendMessage')
+    }
   }
 
-  /** 增量更新某条消息（如流式 content 拼接 / status 变更） */
+  /**
+   * 增量更新某条消息（如流式 status 变更）
+   * DEV：patch 带终态 status（done/error/stopped）时，把完整消息一次性 upsert 到服务端
+   * （onDelta 的 content 拼接不走这里，流式期间零请求）
+   */
   function updateMessage(
     sessionId: string,
     messageId: string,
@@ -178,6 +255,23 @@ export const useChatStore = defineStore('chat', () => {
     const target = list.find((m) => m.id === messageId)
     if (!target) return false
     Object.assign(target, patch)
+    if (useServer && patch.status && patch.status !== 'streaming') {
+      // 快照后发送，避免后续内存变更影响请求体
+      sync(() => getStorage().appendMessage(sessionId, { ...target }), 'upsertMessage')
+    }
+    return true
+  }
+
+  /** 删除单条消息（regenerate 删最后一条 AI 消息用） */
+  function deleteMessage(sessionId: string, messageId: string): boolean {
+    const list = messagesMap.value[sessionId]
+    if (!list) return false
+    const idx = list.findIndex((m) => m.id === messageId)
+    if (idx === -1) return false
+    list.splice(idx, 1)
+    if (useServer) {
+      sync(() => getStorage().deleteMessage(sessionId, messageId), 'deleteMessage')
+    }
     return true
   }
 
@@ -190,12 +284,17 @@ export const useChatStore = defineStore('chat', () => {
     const session = sessions.value.find((s) => s.id === sessionId)
     if (!session) return
     session.title = deriveTitleFromUserContent(content)
+    if (useServer) {
+      sync(() => getStorage().renameSession(sessionId, session.title), 'renameSession')
+    }
   }
 
   return {
     sessions,
     messagesMap,
     activeSessionId,
+    ready,
+    init,
     getMessages,
     touchSession,
     createSession,
@@ -204,6 +303,7 @@ export const useChatStore = defineStore('chat', () => {
     ensureSession,
     appendMessage,
     updateMessage,
+    deleteMessage,
     renameFromFirstUserMessage,
   }
 })

@@ -4,7 +4,10 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "concurrently -n server,vite -c yellow,cyan \"npm:server\" \"npm:dev:web\"",
+    "dev:web": "vite",
+    "server": "tsx watch server/index.ts",
+    "typecheck:server": "tsc -p tsconfig.server.json",
     "build": "vue-tsc -b && vite build",
     "preview": "vite preview"
   },
@@ -23,9 +26,18 @@
     "vue-router": "^4.5.0"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
     "@types/node": "^22.10.2",
     "@vercel/node": "^16.0.1",
     "@vitejs/plugin-vue": "^5.2.1",
+    "better-sqlite3": "^13.0.3",
+    "concurrently": "^10.0.6",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.7",
+    "express": "^5.3.0",
+    "tsx": "^4.23.15",
     "typescript": "~5.6.3",
     "vite": "^6.0.5",
     "vue-tsc": "^2.2.0"
