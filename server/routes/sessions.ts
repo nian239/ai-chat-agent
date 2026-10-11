@@ -6,6 +6,7 @@ import {
   getSession,
   listMessages,
   listSessions,
+  parseSources,
   renameSession,
   upsertMessage,
   type MessageInput,
@@ -87,6 +88,12 @@ sessionRouter.post('/api/sessions/:id/messages', (req, res) => {
     return
   }
 
+  const rawSources = parseSources(body.sources)
+  if (rawSources === null) {
+    res.status(400).json({ message: 'sources 必须是 { docName, chunkIndex, score } 数组' })
+    return
+  }
+
   const input: MessageInput = {
     // id / timestamp 仅在类型合法时透传，否则置 undefined 交由 db 层生成
     id: typeof body.id === 'string' && body.id.trim() ? body.id.trim() : undefined,
@@ -94,6 +101,7 @@ sessionRouter.post('/api/sessions/:id/messages', (req, res) => {
     content: body.content,
     ...(rawStatus ? { status: rawStatus as MessageInput['status'] } : {}),
     ...(typeof body.timestamp === 'number' ? { timestamp: body.timestamp } : {}),
+    ...(rawSources ? { sources: rawSources } : {}),
   }
 
   const saved = upsertMessage(req.params.id, input)

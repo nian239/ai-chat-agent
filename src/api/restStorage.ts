@@ -60,6 +60,7 @@ export const restStorage: ChatStorage = {
       content: message.content,
       status: message.status,
       timestamp: message.timestamp,
+      sources: message.sources,
     })
   },
 

@@ -1,18 +1,26 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, provide, ref, watchEffect } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Setting } from '@element-plus/icons-vue'
+import { Setting, Collection } from '@element-plus/icons-vue'
 import { storeToRefs } from 'pinia'
 import { useSettingsStore } from '@/stores/settings'
 import { useChatStore } from '@/stores/chat'
-import { streamChat } from '@/api/chat'
+import { useKnowledgeStore } from '@/stores/knowledge'
+import { streamChat, type ChatMessage } from '@/api/chat'
+import { queryKnowledge, type RetrievedChunk } from '@/api/documents'
+import type { MessageSource } from '@/types/chat'
 import SessionList from '@/components/chat/SessionList.vue'
 import ChatWindow from '@/components/chat/ChatWindow.vue'
 import ChatInput from '@/components/chat/ChatInput.vue'
+import KnowledgeDrawer from '@/components/knowledge/KnowledgeDrawer.vue'
 
 const settings = useSettingsStore()
 const chatStore = useChatStore()
 const { sessions, activeSessionId } = storeToRefs(chatStore)
+
+// 知识库（RAG）：DEV 走本地 Express 内存向量库
+const knowledge = useKnowledgeStore()
+const knowledgeVisible = ref(false)
 
 // 设置弹窗
 const settingsVisible = ref(false)
@@ -56,6 +64,7 @@ const chatReady = computed(() => chatStore.ready)
 
 onMounted(() => {
   void chatStore.init()
+  void knowledge.init()
 })
 
 /** 模块作用域：当前进行中的流（用于切换/删除时中止并标 done） */
@@ -97,13 +106,28 @@ function handleDelete(id: string) {
   chatStore.deleteSession(id)
 }
 
+/** 把检索到的片段拼成带引用编号的 System Prompt */
+function buildRagPrompt(chunks: RetrievedChunk[]): string {
+  const refs = chunks
+    .map((c, i) => `[${i + 1}] 《${c.docName}》片段 ${c.chunkIndex + 1}:\n${c.content}`)
+    .join('\n\n')
+  return [
+    '你是一个配备知识库的助手。请优先依据下面的参考资料回答用户问题，使用资料时标注对应编号（如 [1] [2]）。',
+    '如果参考资料不足以回答问题，请明确说明知识库中没有相关信息，再用自己的知识补充回答。',
+    '',
+    '【参考资料】',
+    refs,
+  ].join('\n')
+}
+
 /**
  * 启动一次流式回复
  * - 被 handleSend（用户发新消息后）和 regenerate（删最后 AI 消息后）共用
  * - history 自动排除最后一条 streaming 状态的占位消息
  * - finish() 加 status 守卫：stopGeneration 已设 'stopped' 时，abort 触发的 finish('error') 不覆盖
+ * - 有知识库文档时先做 RAG 检索（await 期间占位消息已存在，输入保持禁用）
  */
-function startStream(sessionId: string) {
+async function startStream(sessionId: string) {
   // 流式占位消息
   const aiMsgId = genId('m')
   const placeholder = {
@@ -117,11 +141,34 @@ function startStream(sessionId: string) {
   // 先写入 streaming 占位再置 sending，保证「sending 为真」与「存在 streaming 消息」始终一致
   sending.value = true
 
-  // history 排除刚 push 的占位
-  const history = chatStore
+  // history 排除刚 push 的占位（显式标注 api/chat 的 ChatMessage 类型，便于插入 system 消息）
+  const history: ChatMessage[] = chatStore
     .getMessages(sessionId)
     .filter((m) => m.id !== aiMsgId)
     .map((m) => ({ role: m.role, content: m.content }))
+
+  // ---------- RAG：有知识库文档时，检索 top-3 并拼 System Prompt ----------
+  let ragSources: MessageSource[] | null = null
+  if (knowledge.enabled && knowledge.hasDocuments) {
+    const lastUserMsg = [...history].reverse().find((m) => m.role === 'user')
+    if (lastUserMsg) {
+      try {
+        const chunks = await queryKnowledge(lastUserMsg.content)
+        if (chunks.length > 0) {
+          history.unshift({ role: 'system', content: buildRagPrompt(chunks) })
+          ragSources = chunks.map((c) => ({
+            docName: c.docName,
+            chunkIndex: c.chunkIndex,
+            score: c.score,
+          }))
+        }
+      } catch (err) {
+        // 检索失败降级为普通聊天，不打断回答
+        console.warn('[ChatView] 知识库检索失败，本次直接回答:', err)
+        ElMessage.warning('知识库检索失败，本次直接回答')
+      }
+    }
+  }
 
   /**
    * 收尾：只有流真正结束才会被调用
@@ -137,7 +184,11 @@ function startStream(sessionId: string) {
     // 守卫：若 stopGeneration 已把 status 改为 'stopped'，则不再覆盖
     // 走 updateMessage（而非直接改字段）：DEV 下终态 patch 是 AI 消息落库的唯一触发点
     if (target && target.status === 'streaming') {
-      chatStore.updateMessage(sessionId, aiMsgId, { status })
+      chatStore.updateMessage(sessionId, aiMsgId, {
+        status,
+        // RAG 引用来源随终态一起写入（DEV 落库 / PROD 随 localStorage 持久化）
+        ...(status === 'done' && ragSources ? { sources: ragSources } : {}),
+      })
     }
     if (currentStreamInfo?.messageId === aiMsgId) {
       currentStreamInfo = null
@@ -270,6 +321,9 @@ provide('chatActions', {
         <span class="app-name">AI Chat Agent</span>
       </div>
       <div class="header-right">
+        <el-tag v-if="knowledge.hasDocuments" type="warning" effect="light" round>
+          知识库 × {{ knowledge.documents.length }}
+        </el-tag>
         <el-tag :type="settings.hasUserKey ? 'success' : 'info'" effect="light" round>
           {{ settings.hasUserKey ? '自有 Key' : '免费额度' }}
         </el-tag>
@@ -286,7 +340,17 @@ provide('chatActions', {
         @select="handleSelect"
         @create="handleCreate"
         @delete="handleDelete"
-      />
+      >
+        <template #footer>
+          <div class="knowledge-entry" title="知识库（RAG）" @click="knowledgeVisible = true">
+            <el-icon><Collection /></el-icon>
+            <span class="knowledge-label">知识库</span>
+            <span v-if="knowledge.documents.length > 0" class="knowledge-badge">
+              {{ knowledge.documents.length }}
+            </span>
+          </div>
+        </template>
+      </SessionList>
       <ChatWindow :messages="activeMessages" :session-title="activeSessionTitle">
         <ChatInput
           :disabled="sending || !chatReady"
@@ -296,6 +360,9 @@ provide('chatActions', {
         />
       </ChatWindow>
     </div>
+
+    <!-- 知识库抽屉 -->
+    <KnowledgeDrawer v-model="knowledgeVisible" />
 
     <!-- 设置弹窗 -->
     <el-dialog v-model="settingsVisible" title="设置" width="480px">
@@ -372,5 +439,38 @@ provide('chatActions', {
   display: flex;
   flex: 1;
   min-height: 0;
+}
+
+/* ========== 侧栏知识库入口（SessionList footer 插槽内容） ========== */
+.knowledge-entry {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 16px;
+  padding: 12px 8px;
+  border-top: 1px solid #f0f1f3;
+  font-size: 14px;
+  color: #606266;
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+
+.knowledge-entry:hover {
+  color: #3b55e8;
+}
+
+.knowledge-label {
+  flex: 1;
+}
+
+.knowledge-badge {
+  min-width: 18px;
+  padding: 0 5px;
+  font-size: 12px;
+  line-height: 18px;
+  text-align: center;
+  color: #ffffff;
+  background: #3b55e8;
+  border-radius: 9px;
 }
 </style>

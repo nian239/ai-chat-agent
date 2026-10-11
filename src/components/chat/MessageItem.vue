@@ -65,6 +65,11 @@ function formatTime(ts: number): string {
     minute: '2-digit',
   })
 }
+
+/** 相似度格式化为百分比（余弦 -1 ~ 1，展示时截断为 0 ~ 100%） */
+function formatScore(score: number): string {
+  return `${Math.max(0, Math.round(score * 100))}%`
+}
 </script>
 
 <template>
@@ -84,6 +89,21 @@ function formatTime(ts: number): string {
 
         <!-- 3) AI 完成/错误/停止：渲染 Markdown（含代码高亮，已 DOMPurify 清洗） -->
         <div v-else class="content markdown-body" v-html="renderedHtml"></div>
+      </div>
+
+      <!-- RAG 引用来源（仅走知识库回答的 assistant 消息携带） -->
+      <div v-if="message.sources && message.sources.length > 0" class="sources">
+        <div class="sources-title">引用来源</div>
+        <div
+          v-for="(source, i) in message.sources"
+          :key="i"
+          class="source-item"
+          :title="source.docName"
+        >
+          <span class="source-index">[{{ i + 1 }}]</span>
+          <span class="source-name">{{ source.docName }}</span>
+          <span class="source-meta">片段 {{ source.chunkIndex + 1 }} · 相似度 {{ formatScore(source.score) }}</span>
+        </div>
       </div>
 
       <!-- 操作行：time + 重新生成 / 重试 -->
@@ -204,6 +224,45 @@ function formatTime(ts: number): string {
   gap: 4px;
   margin-top: 4px;
   min-height: 20px;
+}
+
+/* ========== RAG 引用来源 ========== */
+.sources {
+  margin-top: 6px;
+  padding: 8px 12px;
+  font-size: 12px;
+  background: #f5f7fa;
+  border: 1px solid #ebeef5;
+  border-radius: 8px;
+  max-width: 100%;
+}
+
+.sources-title {
+  margin-bottom: 4px;
+  font-weight: 600;
+  color: #909399;
+}
+
+.source-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+  color: #606266;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.source-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #303133;
+}
+
+.source-meta {
+  flex-shrink: 0;
+  color: #909399;
 }
 
 .time {

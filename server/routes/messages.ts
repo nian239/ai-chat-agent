@@ -3,6 +3,7 @@ import {
   deleteMessage,
   getSession,
   listMessages,
+  parseSources,
   upsertMessage,
   type MessageInput,
 } from '../db'
@@ -34,6 +35,11 @@ function parseMessageBody(
   if (b.timestamp !== undefined && typeof b.timestamp !== 'number') {
     return { ok: false, message: 'timestamp 必须是数字' }
   }
+  const sources = parseSources(b.sources)
+  if (sources === null) {
+    return { ok: false, message: 'sources 必须是 { docName, chunkIndex, score } 数组' }
+  }
+
   return {
     ok: true,
     value: {
@@ -42,6 +48,7 @@ function parseMessageBody(
       content: b.content,
       status: b.status === undefined ? undefined : (String(b.status) as MessageInput['status']),
       timestamp: typeof b.timestamp === 'number' ? b.timestamp : undefined,
+      ...(sources ? { sources } : {}),
     },
   }
 }

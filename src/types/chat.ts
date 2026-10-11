@@ -2,6 +2,15 @@ export type MessageRole = 'user' | 'assistant'
 
 export type MessageStatus = 'streaming' | 'done' | 'error' | 'stopped'
 
+/** RAG 回答的引用来源 */
+export interface MessageSource {
+  docName: string
+  /** 片段编号，从 0 开始（展示时 +1） */
+  chunkIndex: number
+  /** 余弦相似度，范围 -1 ~ 1 */
+  score: number
+}
+
 export interface ChatMessage {
   id: string
   role: MessageRole
@@ -16,6 +25,8 @@ export interface ChatMessage {
    * 老消息无值视为 done
    */
   status?: MessageStatus
+  /** RAG 引用来源（仅 assistant 消息，走知识库回答时携带） */
+  sources?: MessageSource[]
 }
 
 export interface ChatSession {

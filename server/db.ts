@@ -29,11 +29,20 @@ db.exec(`
     role       TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
     content    TEXT NOT NULL DEFAULT '',
     status     TEXT CHECK (status IN ('streaming', 'done', 'error', 'stopped')),
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    sources    TEXT
   );
 
   CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
 `)
+
+// 旧库迁移：已存在的 messages 表补 sources 列（JSON 字符串，存 RAG 引用来源）
+// 新库已含该列，ALTER 会因重复列报错，捕获后忽略
+try {
+  db.exec('ALTER TABLE messages ADD COLUMN sources TEXT')
+} catch {
+  // 列已存在，无需迁移
+}
 
 // ---------- DTO（与前端 src/types/chat.ts 结构对齐） ----------
 
@@ -44,6 +53,35 @@ export interface SessionDTO {
   updatedAt: number
 }
 
+/** RAG 引用来源（与前端 src/types/chat.ts 的 MessageSource 对齐） */
+export interface MessageSource {
+  docName: string
+  chunkIndex: number
+  /** 余弦相似度，范围 -1 ~ 1 */
+  score: number
+}
+
+/**
+ * 校验并解析请求体中的 sources 字段
+ * - undefined / null → undefined（未传）
+ * - 合法数组 → MessageSource[]
+ * - 类型不合法 → null（路由层转 400）
+ */
+export function parseSources(raw: unknown): MessageSource[] | undefined | null {
+  if (raw === undefined || raw === null) return undefined
+  if (!Array.isArray(raw)) return null
+  const result: MessageSource[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') return null
+    const it = item as Record<string, unknown>
+    if (typeof it.docName !== 'string' || !it.docName.trim()) return null
+    if (typeof it.chunkIndex !== 'number' || !Number.isInteger(it.chunkIndex) || it.chunkIndex < 0) return null
+    if (typeof it.score !== 'number' || !Number.isFinite(it.score)) return null
+    result.push({ docName: it.docName, chunkIndex: it.chunkIndex, score: it.score })
+  }
+  return result
+}
+
 export interface MessageInput {
   /** 缺省时服务端生成 */
   id?: string
@@ -52,6 +90,7 @@ export interface MessageInput {
   status?: 'streaming' | 'done' | 'error' | 'stopped'
   /** 缺省时取当前时间 */
   timestamp?: number
+  sources?: MessageSource[]
 }
 
 export interface MessageDTO {
@@ -61,6 +100,7 @@ export interface MessageDTO {
   timestamp: number
   /** 与前端约定：无值视为 done */
   status?: 'streaming' | 'done' | 'error' | 'stopped'
+  sources?: MessageSource[]
 }
 
 // ---------- 内部行类型 ----------
@@ -79,6 +119,7 @@ interface MessageRow {
   content: string
   status: string | null
   created_at: number
+  sources: string | null
 }
 
 // ---------- 预编译语句（better-sqlite3 同步 API，全部语句复用） ----------
@@ -97,13 +138,14 @@ const listMessagesStmt = db.prepare(
 )
 const getMessageStmt = db.prepare('SELECT * FROM messages WHERE session_id = ? AND id = ?')
 const upsertMessageStmt = db.prepare(`
-  INSERT INTO messages (id, session_id, role, content, status, created_at)
-  VALUES (@id, @session_id, @role, @content, @status, @created_at)
+  INSERT INTO messages (id, session_id, role, content, status, created_at, sources)
+  VALUES (@id, @session_id, @role, @content, @status, @created_at, @sources)
   ON CONFLICT (id) DO UPDATE SET
     session_id = excluded.session_id,
     role       = excluded.role,
     content    = excluded.content,
-    status     = excluded.status
+    status     = excluded.status,
+    sources    = excluded.sources
 `)
 const deleteMessageStmt = db.prepare('DELETE FROM messages WHERE session_id = ? AND id = ?')
 
@@ -125,12 +167,22 @@ function toSessionDTO(row: SessionRow): SessionDTO {
 }
 
 function toMessageDTO(row: MessageRow): MessageDTO {
+  let sources: MessageSource[] | undefined
+  if (row.sources) {
+    try {
+      const parsed = JSON.parse(row.sources)
+      if (Array.isArray(parsed)) sources = parsed as MessageSource[]
+    } catch {
+      // 脏数据忽略，不影响消息主体
+    }
+  }
   return {
     id: row.id,
     role: row.role as MessageDTO['role'],
     content: row.content,
     timestamp: row.created_at,
     ...(row.status ? { status: row.status as MessageDTO['status'] } : {}),
+    ...(sources ? { sources } : {}),
   }
 }
 
@@ -201,6 +253,7 @@ export function upsertMessage(sessionId: string, msg: MessageInput): MessageDTO 
       content: msg.content,
       status: msg.status ?? null,
       created_at: createdAt,
+      sources: msg.sources ? JSON.stringify(msg.sources) : null,
     })
     touchSessionStmt.run(now, sessionId)
   })

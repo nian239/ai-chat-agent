@@ -9,6 +9,7 @@ import { logger } from './middleware/logger'
 import { sessionRouter } from './routes/sessions'
 import { messageRouter } from './routes/messages'
 import { chatRouter } from './routes/chat'
+import { documentRouter } from './routes/documents'
 
 const app = express()
 
@@ -19,6 +20,7 @@ app.use(logger)
 app.use(sessionRouter)
 app.use(messageRouter)
 app.use(chatRouter)
+app.use(documentRouter)
 
 app.use(errorHandler)
 

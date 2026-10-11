@@ -73,6 +73,9 @@ function handleDelete(e: Event, id: string) {
       </div>
       <div v-if="sortedSessions.length === 0" class="empty-tip">暂无会话</div>
     </div>
+
+    <!-- 侧栏底部扩展区（知识库入口等，内容由父组件注入） -->
+    <slot name="footer" />
   </aside>
 </template>
 
